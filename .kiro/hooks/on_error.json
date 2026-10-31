@@ -1,0 +1,5 @@
+{
+  "name": "spook_error_handler",
+  "trigger": "command_failed",
+  "action": "python3 -m spookcli.overlay"
+}
