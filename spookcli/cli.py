@@ -100,3 +100,18 @@ def run(command: tuple[str, ...]) -> None:
 
         trigger_ghost_event()
         sys.exit(result.exit_code)
+
+
+@main.command("test-ghost")
+def test_ghost() -> None:
+    """
+    Developer shortcut: trigger the full ghost event without running a command.
+
+    Plays ghost_scream.wav, opens the animated overlay, and exits cleanly.
+    Useful for verifying assets and the overlay behaviour during development.
+    """
+    from spookcli.ghost import trigger_ghost_event
+
+    click.echo(click.style("[SpookCLI] Triggering ghost event for testing...", fg="yellow", bold=True))
+    trigger_ghost_event()
+    click.echo(click.style("[SpookCLI] Ghost event completed.", fg="green", bold=True))
