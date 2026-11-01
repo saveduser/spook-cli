@@ -1,4 +1,9 @@
 # Feature Spec: gtop (Haunted Textual Process Monitor)
+## Design Source (Stitch MCP)
+- **Project URL:** `https://stitch.withgoogle.com/projects/8216542245551026445?node-id=c914e054770c442f9bb6729f609a4b80`
+
+- **Reference Asset:** Must explicitly utilize the `image_f3cf1f.jpg` file verbatim for the mascot UI integration.
+- **Exclusion:** Ignore the right-hand "Audio & Interaction Blueprint" panel in the design; only implement the left-hand application UI.
 
 1. **Goal**
 A cross-platform terminal process monitor built with `textual`. It features a standard process data table on the base layer, with absolute-positioned ASCII ghosts floating on a higher z-index that taunt the user based on live system metrics.
