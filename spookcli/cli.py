@@ -335,6 +335,19 @@ def install_hook(shell: str, dry_run: bool) -> None:
     click.echo(f"     '{_HOOK_MARKER}' and '{_HOOK_MARKER} end' in {profile_path}")
 
 
+@main.command("gtop")
+def gtop() -> None:
+    """
+    Open gtop — the Haunted Process Monitor desktop widget.
+
+    Launches a frameless, glassmorphic PyQt6 window with a live process
+    table, taunting Kiro mascot, CPU/RAM gauges, candy bucket, and crypt
+    for slain processes. Press Q or Esc to quit.
+    """
+    from spookcli.gtop import run_gtop
+    run_gtop()
+
+
 @main.command("board")
 def board() -> None:
     """

@@ -16,6 +16,8 @@ Internal layout:
 """
 
 from __future__ import annotations
+import contextlib
+import os
 import time
 import math
 import random
@@ -25,7 +27,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Asset resolution — all paths are absolute so they work regardless of cwd
 # ---------------------------------------------------------------------------
-_ASSETS_DIR   = Path(__file__).parent.parent / "assets"
+_ASSETS_DIR   = Path(__file__).parent / "assets"
 _GHOST_GIF    = _ASSETS_DIR / "ghost-kiro-blink.gif"
 _PUMPKIN_PNG  = _ASSETS_DIR / "pumpkin.png"
 _SCREAM_WAV   = _ASSETS_DIR / "ghost_scream.wav"
@@ -62,6 +64,31 @@ _EXORCISE_DIST = 100
 _AUDIO_AVAILABLE: bool | None = None  # None = not yet attempted
 
 
+@contextlib.contextmanager
+def _quiet_native_stderr():
+    if not sys.platform.startswith("linux"):
+        yield
+        return
+    saved = devnull = None
+    try:
+        saved = os.dup(2)
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, 2)
+    except OSError:
+        if saved is not None:
+            os.close(saved)
+        if devnull is not None:
+            os.close(devnull)
+        yield
+        return
+    try:
+        yield
+    finally:
+        os.dup2(saved, 2)
+        os.close(saved)
+        os.close(devnull)
+
+
 def _ensure_audio() -> bool:
     """
     Initialise pygame.mixer on first call and cache the result.
@@ -73,19 +100,52 @@ def _ensure_audio() -> bool:
     if _AUDIO_AVAILABLE is not None:
         return _AUDIO_AVAILABLE
 
+    os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
     try:
         import pygame  # type: ignore
 
-        if not pygame.get_init():
-            pygame.init()
+        if pygame.mixer.get_init():
+            _AUDIO_AVAILABLE = True
+            return _AUDIO_AVAILABLE
 
-        if not pygame.mixer.get_init():
-            # pre_init with safe defaults improves compatibility on headless
-            # systems (ALSA dummy device, null driver, WSL, CI, etc.)
-            pygame.mixer.pre_init(frequency=44100, size=-16, channels=2, buffer=512)
-            pygame.mixer.init()
+        explicit = os.environ.get("SDL_AUDIODRIVER", "").strip()
+        if explicit:
+            candidates = [explicit]
+        elif sys.platform.startswith("linux"):
+            candidates = ["pulseaudio", "pipewire", "alsa"]
+        else:
+            candidates = [""]
 
-        _AUDIO_AVAILABLE = True
+        error = ""
+        for driver in candidates:
+            try:
+                pygame.mixer.quit()
+            except Exception:
+                pass
+            if driver:
+                os.environ["SDL_AUDIODRIVER"] = driver
+            else:
+                os.environ.pop("SDL_AUDIODRIVER", None)
+            try:
+                with _quiet_native_stderr():
+                    pygame.mixer.pre_init(
+                        frequency=44100,
+                        size=-16,
+                        channels=2,
+                        buffer=512,
+                    )
+                    pygame.mixer.init()
+                _AUDIO_AVAILABLE = True
+                return _AUDIO_AVAILABLE
+            except Exception as exc:
+                error = f"{driver or 'default'}: {exc}"
+
+        _AUDIO_AVAILABLE = False
+        print(
+            "  [ghost/audio] Audio device unavailable — running in silent mode. "
+            f"({error})",
+            file=sys.stderr,
+        )
 
     except Exception as exc:
         _AUDIO_AVAILABLE = False
@@ -300,7 +360,7 @@ class GhostWidget:
     of the sprite so the two always travel together — during float animation
     and during drag.
 
-    If assets/ghost-kiro-blink.gif loads successfully, the GIF plays via
+    If spookcli/assets/ghost-kiro-blink.gif loads successfully, the GIF plays via
     QMovie (blink animation included). Otherwise a procedural purple/white
     ghost is painted via QPainter as a fallback.
 
@@ -471,7 +531,7 @@ class PumpkinWidget:
     """
     Static pumpkin bucket anchored to the bottom-right corner of the screen.
 
-    Renders assets/pumpkin.png via QPixmap. Falls back to a procedurally
+    Renders spookcli/assets/pumpkin.png via QPixmap. Falls back to a procedurally
     drawn jack-o'-lantern if the file is absent or unreadable.
     """
 
@@ -562,7 +622,7 @@ class SpeechBubbleWidget:
     _FONT_PT = 11
 
     def __init__(self, text: str):
-        from PyQt6.QtCore import Qt, QPoint
+        from PyQt6.QtCore import Qt
         from PyQt6.QtWidgets import QLabel
         from PyQt6.QtGui import QFont, QFontMetrics
 
@@ -595,7 +655,7 @@ class SpeechBubbleWidget:
 
     def _render(self, font, fm, line_h):
         from PyQt6.QtGui import (
-            QPixmap, QPainter, QColor, QPainterPath, QBrush, QPen, QFont
+            QPixmap, QPainter, QColor, QPainterPath, QBrush, QPen
         )
 
         canvas = QPixmap(self._w, self._h)

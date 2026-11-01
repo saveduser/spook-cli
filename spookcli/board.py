@@ -564,7 +564,7 @@ def _mark_resurrected(entry_ts: str) -> None:
 
 
 def _play_resurrect_audio() -> None:
-    """Play assets/ghost_caught.wav if available, else fall back silently."""
+    """Play spookcli/assets/ghost_caught.wav if available, else fall back silently."""
     try:
         from spookcli.ghost import _ensure_audio, _play_sound, _ASSETS_DIR
         wav = _ASSETS_DIR / "ghost_caught.wav"
