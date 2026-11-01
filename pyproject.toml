@@ -7,11 +7,12 @@ name = "spookcli"
 version = "0.1.0"
 description = "🎃 A Halloween-themed CLI wrapper that summons ghosts on failure"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
     "click==8.1.8",
     "pygame==2.6.1",
     "PyQt6==6.8.1",
+    "psutil==6.1.1",
 ]
 
 [project.scripts]

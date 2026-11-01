@@ -1,0 +1,15 @@
+{
+  "total_failures": 0,
+  "total_resurrected": 0,
+  "total_banished": 0,
+  "log": [
+    {
+      "id": "uuid4_string",
+      "timestamp": "ISO-8601",
+      "command": "git comit",
+      "exit_code": 1,
+      "error_type": "git_typo",
+      "status": "haunting" 
+    }
+  ]
+}
