@@ -20,6 +20,7 @@ import random
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -30,6 +31,7 @@ from PyQt6.QtCore import (
     QPoint,
     QPointF,
     QPropertyAnimation,
+    QRect,
     QRectF,
     QSize,
     Qt,
@@ -78,6 +80,7 @@ C_DIM = "#A89CB9"
 C_ORANGE = "#FF7A00"
 C_GREEN = "#39FF14"
 C_PURPLE = "#BD00FF"
+C_ICY = "#7DE9FF"
 
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 
@@ -86,6 +89,22 @@ WHISPER_SECS = 4.0
 CPU_SPIKE = 50.0
 MEM_SPIKE = 40.0
 MAX_PROCS = 25
+
+# Ports whose current holders are treated as squatters / port hauntings.
+HAUNTED_PORTS: dict[int, str] = {
+    8080: "web",
+    3000: "dev",
+    5432: "postgres",
+    8000: "http",
+    5173: "vite",
+    3306: "mysql",
+    6379: "redis",
+}
+
+LEAK_WINDOW = 8
+LEAK_GROWTH_MB = 12.0
+LEAK_FALLBACK_MB = 250.0
+TRACE_MAX_ROWS = 80
 
 _TAUNTS = {
     "ram": [
@@ -138,6 +157,7 @@ def _style(template: str) -> str:
         .replace("@ORANGE@", C_ORANGE)
         .replace("@GREEN@", C_GREEN)
         .replace("@PURPLE@", C_PURPLE)
+        .replace("@ICY@", C_ICY)
     )
 
 
@@ -174,6 +194,19 @@ class ProcessRow:
     cpu: float
     mem: float
     status: str
+    ppid: int = 0
+    rss_mb: float = 0.0
+    num_threads: int = 1
+    ports: list[int] = field(default_factory=list)
+    leak: bool = False
+
+    @property
+    def haunted_ports(self) -> list[int]:
+        return [port for port in self.ports if port in HAUNTED_PORTS]
+
+    @property
+    def squatter(self) -> bool:
+        return bool(self.haunted_ports)
 
 
 @dataclass
@@ -184,9 +217,13 @@ class SystemSnapshot:
     mem_total_gb: float = 0.0
     core_count: int = 0
     processes: list[ProcessRow] = field(default_factory=list)
+    all_processes: list[ProcessRow] = field(default_factory=list)
     top_cpu: ProcessRow | None = None
     top_mem: ProcessRow | None = None
     zombie_pids: list[int] = field(default_factory=list)
+    leak_pid: int | None = None
+    leak_growth: float = 0.0
+    squatter_count: int = 0
 
 
 @dataclass
@@ -196,7 +233,77 @@ class CryptEntry:
     signal: str
 
 
-def _collect_snapshot() -> SystemSnapshot:
+def _listening_ports() -> dict[int, list[int]]:
+    """Map PID -> sorted listening TCP ports. Degrades to {} when denied."""
+    mapping: dict[int, set[int]] = {}
+    try:
+        connections = psutil.net_connections(kind="inet")
+    except (psutil.AccessDenied, OSError):
+        return {}
+    except Exception:
+        return {}
+
+    for connection in connections:
+        try:
+            if connection.status != psutil.CONN_LISTEN or connection.pid is None:
+                continue
+            if connection.laddr is None:
+                continue
+            port = int(connection.laddr.port)
+            mapping.setdefault(int(connection.pid), set()).add(port)
+        except Exception:
+            continue
+
+    return {pid: sorted(ports) for pid, ports in mapping.items()}
+
+
+def _update_rss_history(
+    rows: list[ProcessRow], history: dict[int, deque[float]]
+) -> None:
+    alive = {row.pid for row in rows}
+    for pid in [pid for pid in history if pid not in alive]:
+        history.pop(pid, None)
+    for row in rows:
+        history.setdefault(row.pid, deque(maxlen=LEAK_WINDOW)).append(row.rss_mb)
+
+
+def _detect_leak(
+    rows: list[ProcessRow], history: dict[int, deque[float]]
+) -> tuple[int | None, float]:
+    """Prefer a process whose RSS is steadily climbing, else the biggest hog."""
+    best_growth = 0.0
+    best_pid: int | None = None
+
+    own_pid = os.getpid()
+    for row in rows:
+        if row.pid == own_pid:
+            continue
+        samples = history.get(row.pid)
+        if not samples or len(samples) < 3:
+            continue
+        growth = samples[-1] - samples[0]
+        if growth >= LEAK_GROWTH_MB and samples[-1] >= samples[0] - 1.0:
+            if growth > best_growth:
+                best_growth = growth
+                best_pid = row.pid
+
+    if best_pid is not None:
+        return best_pid, best_growth
+
+    candidates = [
+        row
+        for row in rows
+        if row.pid != own_pid and row.rss_mb >= LEAK_FALLBACK_MB
+    ]
+    if candidates:
+        biggest = max(candidates, key=lambda row: row.rss_mb)
+        return biggest.pid, 0.0
+    return None, 0.0
+
+
+def _collect_snapshot(
+    rss_history: dict[int, deque[float]] | None = None,
+) -> SystemSnapshot:
     snapshot = SystemSnapshot()
 
     try:
@@ -220,11 +327,26 @@ def _collect_snapshot() -> SystemSnapshot:
     rows: list[ProcessRow] = []
     try:
         iterator = psutil.process_iter(
-            ["pid", "name", "cpu_percent", "memory_percent", "status"]
+            [
+                "pid",
+                "name",
+                "cpu_percent",
+                "memory_percent",
+                "status",
+                "ppid",
+                "num_threads",
+                "memory_info",
+            ]
         )
         for proc in iterator:
             try:
                 info = proc.info
+                memory_info = info.get("memory_info")
+                rss_mb = (
+                    float(getattr(memory_info, "rss", 0) or 0) / (1024 * 1024)
+                    if memory_info is not None
+                    else 0.0
+                )
                 rows.append(
                     ProcessRow(
                         pid=int(info.get("pid") or 0),
@@ -232,6 +354,9 @@ def _collect_snapshot() -> SystemSnapshot:
                         cpu=round(float(info.get("cpu_percent") or 0.0), 1),
                         mem=round(float(info.get("memory_percent") or 0.0), 1),
                         status=str(info.get("status") or ""),
+                        ppid=int(info.get("ppid") or 0),
+                        rss_mb=round(rss_mb, 1),
+                        num_threads=int(info.get("num_threads") or 1),
                     )
                 )
             except (psutil.AccessDenied, psutil.NoSuchProcess):
@@ -241,8 +366,32 @@ def _collect_snapshot() -> SystemSnapshot:
     except Exception:
         pass
 
-    rows.sort(key=lambda row: (-row.cpu, -row.mem))
+    port_map = _listening_ports()
+    for row in rows:
+        ports = port_map.get(row.pid)
+        if ports:
+            row.ports = ports
+
+    if rss_history is not None:
+        _update_rss_history(rows, rss_history)
+        snapshot.leak_pid, snapshot.leak_growth = _detect_leak(
+            rows, rss_history
+        )
+        for row in rows:
+            row.leak = row.pid == snapshot.leak_pid
+
+    # Port squatters first, then suspected leaks, then the usual CPU/memory race.
+    rows.sort(
+        key=lambda row: (
+            0 if row.squatter else 1,
+            0 if row.leak else 1,
+            -row.cpu,
+            -row.mem,
+        )
+    )
+    snapshot.all_processes = rows
     snapshot.processes = rows[:MAX_PROCS]
+    snapshot.squatter_count = sum(1 for row in rows if row.squatter)
 
     if rows:
         snapshot.top_cpu = max(rows, key=lambda row: row.cpu)
@@ -260,6 +409,7 @@ class SnapshotWorker(QThread):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._stop_event = threading.Event()
+        self._rss_history: dict[int, deque[float]] = {}
 
     def run(self) -> None:
         try:
@@ -275,7 +425,7 @@ class SnapshotWorker(QThread):
 
         while not self._stop_event.is_set():
             try:
-                snap = _collect_snapshot()
+                snap = _collect_snapshot(self._rss_history)
             except Exception:
                 snap = SystemSnapshot()
             self.snapshot_ready.emit(snap)
@@ -388,6 +538,25 @@ class AudioEngine:
                 sound.set_volume(volume)
                 self._sounds[name] = sound
             sound.play()
+        except Exception:
+            pass
+    def play_loop(self, name: str, volume: float = 0.55) -> None:
+        if self.muted:
+            return
+        path = ASSETS_DIR / name
+        if not path.exists() or not self._ensure_audio():
+            return
+        try:
+            import pygame
+
+            sound = self._sounds.get(name)
+            if sound is None:
+                sound = pygame.mixer.Sound(str(path))
+                sound.set_volume(volume)
+                self._sounds[name] = sound
+            
+            # The loops=-1 argument tells pygame to repeat the sound indefinitely
+            sound.play(loops=-1)
         except Exception:
             pass
 
@@ -784,6 +953,7 @@ class CandyBanner(QFrame):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._count = 666
+        self._is_contained = False
         self._shake_animation: QPropertyAnimation | None = None
         self.setFixedHeight(58)
         self.setStyleSheet(
@@ -883,7 +1053,25 @@ class CandyBanner(QFrame):
         boo.clicked.connect(self.spook_requested.emit)
         layout.addWidget(boo)
 
+    @property
+    def pumpkin_label(self) -> QLabel:
+        return self._pumpkin
+
+    def set_contained(self, contained: bool = True) -> None:
+        self._is_contained = contained
+        if contained:
+            self._count_label.setText(
+                f"<span style='color:{C_DIM};font-size:8px;font-family:monospace;'>"
+                f"TREATS COLLECTED: "
+                f"<span style='color:{C_PURPLE};font-weight:700;font-size:9px;'>"
+                f"1 SOUL (CONTAINED)</span></span>"
+            )
+        else:
+            self._refresh_count()
+
     def _refresh_count(self, count_color: str = C_ORANGE) -> None:
+        if getattr(self, "_is_contained", False):
+            return
         self._count_label.setText(
             f"<span style='color:{C_DIM};font-size:8px;font-family:monospace;'>"
             f"TREATS COLLECTED: "
@@ -909,72 +1097,9 @@ class CandyBanner(QFrame):
 
     def add_treats(self, amount: int = 1) -> None:
         self._count += amount
-        self._refresh_count(C_GREEN)
-        QTimer.singleShot(420, self._refresh_count)
-
-
-class MascotCard(QWidget):
-    clicked = pyqtSignal()
-
-    def __init__(self, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setFixedSize(92, 92)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("Click Kiro for a spectral prophecy")
-
-        halo = QFrame(self)
-        halo.setGeometry(0, 0, 92, 92)
-        halo.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        halo.setStyleSheet(
-            "background: qradialgradient(cx:0.5, cy:0.5, radius:0.5,"
-            " fx:0.5, fy:0.5,"
-            " stop:0 rgba(57, 255, 20, 70),"
-            " stop:0.45 rgba(189, 0, 255, 80),"
-            " stop:1 rgba(255, 122, 0, 0));"
-            " border-radius: 46px;"
-        )
-
-        self._gif = QLabel(self)
-        self._gif.setGeometry(10, 9, 72, 70)
-        self._gif.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._gif.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self._gif.setStyleSheet("background: transparent;")
-
-        self._movie = _load_ghost_movie(QSize(68, 68))
-        if self._movie is not None:
-            self._gif.setMovie(self._movie)
-            self._movie.start()
-        else:
-            self._gif.setText("👻")
-            self._gif.setStyleSheet("font-size: 42px; background: transparent;")
-
-        tag = QLabel("kiro.daemon", self)
-        tag.setGeometry(12, 76, 68, 14)
-        tag.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        tag.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        tag.setStyleSheet(
-            _style(
-                "color: @DIM@;"
-                " font-size: 8px;"
-                " background: rgba(11, 8, 19, 235);"
-                " border: 1px solid @BORDER@;"
-                " border-radius: 3px;"
-            )
-        )
-
-        self._phase = 0.0
-        self._float_timer = QTimer(self)
-        self._float_timer.timeout.connect(self._float)
-        self._float_timer.start(60)
-
-    def _float(self) -> None:
-        self._phase = (self._phase + 0.08) % (math.pi * 2)
-        self._gif.move(10, int(9 + math.sin(self._phase) * 3))
-
-    def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit()
-        super().mousePressEvent(event)
+        if not getattr(self, "_is_contained", False):
+            self._refresh_count(C_GREEN)
+            QTimer.singleShot(420, self._refresh_count)
 
 
 class SpeechBubble(QFrame):
@@ -988,7 +1113,7 @@ class SpeechBubble(QFrame):
         self.setStyleSheet("background: transparent; border: none;")
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 9, 10, 8)
+        layout.setContentsMargins(14, 9, 12, 8)
         layout.setSpacing(4)
 
         top = QHBoxLayout()
@@ -1076,16 +1201,9 @@ class SpeechBubble(QFrame):
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = QRectF(self.rect()).adjusted(9.0, 0.8, -0.8, -0.8)
+        rect = QRectF(self.rect()).adjusted(1.0, 1.0, -1.0, -1.0)
         path = QPainterPath()
         path.addRoundedRect(rect, 8.0, 8.0)
-
-        arrow = QPainterPath()
-        arrow.moveTo(rect.left() + 1, rect.top() + 31)
-        arrow.lineTo(0.5, rect.top() + 37)
-        arrow.lineTo(rect.left() + 1, rect.top() + 43)
-        arrow.closeSubpath()
-        path = path.united(arrow)
 
         painter.setPen(QPen(self._accent, 1.1))
         painter.setBrush(QColor(11, 8, 19, 242))
@@ -1111,15 +1229,12 @@ class MascotPanel(QFrame):
         )
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 8, 12, 8)
+        layout.setSpacing(0)
 
-        self.mascot = MascotCard()
-        self.mascot.clicked.connect(self.mascot_clicked.emit)
         self.bubble = SpeechBubble()
         self.bubble.poke_requested.connect(self.poke_requested.emit)
 
-        layout.addWidget(self.mascot)
         layout.addWidget(self.bubble, 1)
 
     def set_taunt(
@@ -1141,12 +1256,16 @@ class ProcessRowWidget(QFrame):
         self,
         row: ProcessRow,
         stripe: bool = False,
+        depth: int = 0,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._row = row
         self._stripe = stripe
+        self._depth = depth
         self._selected = False
+        self._cursed = False
+        self._branch = False
         self._accent = C_DIM
         self.setFixedHeight(36)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -1163,15 +1282,26 @@ class ProcessRowWidget(QFrame):
         name_box = QWidget()
         name_box.setStyleSheet("background: transparent;")
         name_layout = QHBoxLayout(name_box)
-        name_layout.setContentsMargins(0, 0, 0, 0)
+        name_layout.setContentsMargins(depth * 11, 0, 0, 0)
         name_layout.setSpacing(6)
         self._dot = QLabel()
         self._dot.setFixedSize(6, 6)
         self._name = _label(row.name, C_TEXT, 10, bold=True)
         self._tag = _label("", C_DIM, 9)
+        self._port = _label("", C_ORANGE, 8, bold=True)
+        self._port.setStyleSheet(
+            f"color: {C_ORANGE};"
+            f" border: 1px solid {C_ORANGE};"
+            " border-radius: 3px;"
+            " padding: 0 3px;"
+            " font-size: 8px;"
+            " font-weight: 700;"
+        )
+        self._port.hide()
         name_layout.addWidget(self._dot)
         name_layout.addWidget(self._name)
         name_layout.addWidget(self._tag)
+        name_layout.addWidget(self._port)
         name_layout.addStretch(1)
         layout.addWidget(name_box, 1)
 
@@ -1212,17 +1342,37 @@ class ProcessRowWidget(QFrame):
         self.set_data(row)
         self._apply_style()
 
-    def set_data(self, row: ProcessRow) -> None:
+    def set_data(
+        self,
+        row: ProcessRow,
+        cursed: bool = False,
+        branch: bool = False,
+    ) -> None:
         self._row = row
+        self._cursed = cursed
+        self._branch = branch
         self._pid.setText(str(row.pid))
         display_name = row.name if len(row.name) <= 22 else f"{row.name[:21]}…"
         self._name.setText(display_name)
         self._name.setToolTip(row.name)
-        self.setToolTip(f"{row.name} (PID {row.pid})")
 
-        if row.status == psutil.STATUS_ZOMBIE:
+        details = [f"{row.name} (PID {row.pid})", f"ppid {row.ppid}"]
+        if row.rss_mb:
+            details.append(f"{row.rss_mb:.0f} MB RSS")
+        details.append(f"{row.num_threads} threads")
+        if row.ports:
+            details.append("ports " + ", ".join(str(port) for port in row.ports))
+        self.setToolTip(" · ".join(details))
+
+        if cursed:
+            accent = C_ICY
+            tag = "(cursed)"
+        elif row.status == psutil.STATUS_ZOMBIE:
             accent = C_PURPLE
             tag = "(zombie)"
+        elif row.leak:
+            accent = C_PURPLE
+            tag = "LEAK"
         elif row.cpu >= CPU_SPIKE:
             accent = C_ORANGE
             tag = "(curse)"
@@ -1241,6 +1391,17 @@ class ProcessRowWidget(QFrame):
         self._tag.setStyleSheet(
             f"color: {accent}; font-size: 9px; background: transparent;"
         )
+
+        haunted = row.haunted_ports
+        if haunted:
+            self._port.setText(":" + "/".join(str(port) for port in haunted[:2]))
+            self._port.setToolTip(
+                ", ".join(f"{port}:{HAUNTED_PORTS[port]}" for port in haunted)
+            )
+            self._port.show()
+        else:
+            self._port.hide()
+
         self._cpu.setText(f"{row.cpu:.1f}%")
         self._cpu.setStyleSheet(
             f"color: {accent if row.cpu >= CPU_SPIKE else C_DIM};"
@@ -1268,24 +1429,34 @@ class ProcessRowWidget(QFrame):
             f" background: {accent};"
             f"}}"
         )
+        self._sync_kill_visibility()
         self._apply_style()
+
+    def _sync_kill_visibility(self) -> None:
+        always = self._selected or self._row.squatter
+        self._kill_effect.setOpacity(1.0 if always else 0.0)
 
     def set_selected(self, selected: bool) -> None:
         self._selected = selected
-        self._kill_effect.setOpacity(1.0 if selected else 0.0)
+        self._sync_kill_visibility()
         self._apply_style()
 
     def _apply_style(self) -> None:
-        if self._selected:
+        if self._cursed:
+            background = "rgba(125, 233, 255, 32)"
+            border = C_ICY
+            pid_color = C_ICY
+            name_color = C_ICY
+        elif self._selected:
             background = "rgba(189, 0, 255, 34)"
             border = C_PURPLE
             pid_color = C_TEXT
             name_color = C_TEXT
         else:
             background = "rgba(18, 11, 29, 95)" if self._stripe else "transparent"
-            border = "transparent"
+            border = C_ICY if self._branch else "transparent"
             pid_color = C_DIM
-            name_color = C_TEXT if self._accent != C_DIM else C_TEXT
+            name_color = C_TEXT
 
         self.setStyleSheet(
             f"ProcessRowWidget {{"
@@ -1312,7 +1483,7 @@ class ProcessRowWidget(QFrame):
         cursor_inside = self.rect().contains(
             self.mapFromGlobal(QCursor.pos())
         )
-        if not self._selected and not cursor_inside:
+        if not self._selected and not self._row.squatter and not cursor_inside:
             self._kill_effect.setOpacity(0.0)
         super().leaveEvent(event)
 
@@ -1329,6 +1500,9 @@ class ProcessTable(QFrame):
         super().__init__(parent)
         self._rows: list[ProcessRowWidget] = []
         self._pids: list[int] = []
+        self._depths: dict[int, int] = {}
+        self._cursed_pids: set[int] = set()
+        self._branch_pids: set[int] = set()
         self._selected_pid: int | None = None
         self.setMinimumHeight(220)
         self.setStyleSheet("background: rgba(11, 8, 19, 155); border: none;")
@@ -1394,13 +1568,49 @@ class ProcessTable(QFrame):
         layout.addWidget(header)
         layout.addWidget(self._scroll, 1)
 
-    def update_rows(self, processes: list[ProcessRow]) -> None:
+    def update_rows(
+        self,
+        processes: list[ProcessRow],
+        cursed_pids: set[int] | None = None,
+        depths: dict[int, int] | None = None,
+        branch_pids: set[int] | None = None,
+    ) -> None:
+        if cursed_pids is not None:
+            self._cursed_pids = set(cursed_pids)
+        depths = depths or {}
+        if branch_pids is not None:
+            self._branch_pids = set(branch_pids)
+
         pids = [row.pid for row in processes]
-        if pids != self._pids:
+        if pids != self._pids or depths != self._depths:
+            self._depths = dict(depths)
             self._rebuild(processes)
-        else:
-            for widget, row in zip(self._rows, processes):
-                widget.set_data(row)
+            return
+
+        for widget, row in zip(self._rows, processes):
+            widget.set_data(
+                row,
+                cursed=row.pid in self._cursed_pids,
+                branch=row.pid in self._branch_pids,
+            )
+
+    def set_cursed_pids(self, pids: set[int]) -> None:
+        self._cursed_pids = set(pids)
+        for widget in self._rows:
+            widget.set_data(
+                widget._row,
+                cursed=widget._row.pid in self._cursed_pids,
+                branch=widget._row.pid in self._branch_pids,
+            )
+
+    def set_branch_pids(self, pids: set[int]) -> None:
+        self._branch_pids = set(pids)
+        for widget in self._rows:
+            widget.set_data(
+                widget._row,
+                cursed=widget._row.pid in self._cursed_pids,
+                branch=widget._row.pid in self._branch_pids,
+            )
 
     def _rebuild(self, processes: list[ProcessRow]) -> None:
         while self._body_layout.count():
@@ -1422,7 +1632,16 @@ class ProcessTable(QFrame):
             return
 
         for index, row in enumerate(processes):
-            widget = ProcessRowWidget(row, stripe=index % 2 == 1)
+            widget = ProcessRowWidget(
+                row,
+                stripe=index % 2 == 1,
+                depth=self._depths.get(row.pid, 0),
+            )
+            widget.set_data(
+                row,
+                cursed=row.pid in self._cursed_pids,
+                branch=row.pid in self._branch_pids,
+            )
             widget.kill_requested.connect(self.kill_requested.emit)
             widget.selected.connect(self.select_pid)
             self._body_layout.addWidget(widget)
@@ -1645,11 +1864,13 @@ class FooterBar(QFrame):
         )
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 4, 12, 4)
-        layout.setSpacing(9)
+        layout.setContentsMargins(10, 4, 10, 4)
+        layout.setSpacing(6)
 
         for key, action in (
             ("k", "Exorcise"),
+            ("c", "Curse"),
+            ("T", "Trace"),
             ("r", "Resurrect"),
             ("s", "Spook"),
             ("m", "Mute"),
@@ -1757,59 +1978,147 @@ class GhostSwarm(QWidget):
         group.deleteLater()
 
 
-class FlyingKiro(QWidget):
+class DraggableGhost(QLabel):
     clicked = pyqtSignal()
+    captured = pyqtSignal()
+    escaped = pyqtSignal()
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QWidget | None = None, bucket: CandyBanner | None = None) -> None:
         super().__init__(parent)
-        self.setFixedSize(112, 108)
+        self._bucket = bucket
+        self.setFixedSize(78, 78)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("Click Kiro for a spooky surprise or soul candy!")
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setToolTip("Drag Kiro into the Soul Candy Bucket to capture it!")
 
-        self._rotation = 0.0
-        self._patrol_scale = 1.0
-        self._hover_scale = 1.0
+        self._drag_start_pos: QPoint | None = None
+        self._drag_offset: QPoint | None = None
+        self._is_dragging: bool = False
+        self._is_captured: bool = False
         self._group: QParallelAnimationGroup | None = None
 
         self._movie = _load_ghost_movie(QSize(78, 78))
         if self._movie is not None:
-            self._movie.frameChanged.connect(self.update)
+            self.setMovie(self._movie)
             self._movie.start()
+        else:
+            self.setText("👻")
+            self.setStyleSheet("font-size: 48px; background: transparent;")
 
-        self._badge = QLabel("● KIRO (PATROL)", self)
-        self._badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self._badge.setGeometry(4, 88, 104, 16)
-        self._badge.setStyleSheet(
-            "color: #39FF14;"
-            " background: rgba(11, 8, 19, 225);"
-            " border: 1px solid rgba(57, 255, 20, 170);"
-            " border-radius: 3px;"
-            " font-size: 8px;"
-            " font-weight: 700;"
-        )
+    def set_bucket(self, bucket: CandyBanner) -> None:
+        self._bucket = bucket
 
-    def _get_rotation(self) -> float:
-        return self._rotation
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        center = QPointF(self.width() / 2.0, self.height() / 2.0)
+        aura = QRadialGradient(center, self.width() / 2.0)
+        aura.setColorAt(0.0, QColor(57, 255, 20, 80))
+        aura.setColorAt(0.45, QColor(189, 0, 255, 70))
+        aura.setColorAt(1.0, QColor(255, 122, 0, 0))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(aura)
+        painter.drawEllipse(center, self.width() / 2.0, self.height() / 2.0)
+        painter.end()
+        super().paintEvent(event)
 
-    def _set_rotation(self, value: float) -> None:
-        self._rotation = float(value)
-        self.update()
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_pos = event.position().toPoint()
+            self._drag_start_global = event.globalPosition().toPoint()
+            self._drag_offset = event.position().toPoint()
+            self._is_dragging = False
+            self.stop_patrol()
+            self.raise_()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        super().mousePressEvent(event)
 
-    rotation = pyqtProperty(float, _get_rotation, _set_rotation)
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_offset is not None and (event.buttons() & Qt.MouseButton.LeftButton):
+            if not self._is_dragging and getattr(self, "_drag_start_global", None) is not None:
+                if (event.globalPosition().toPoint() - self._drag_start_global).manhattanLength() > 3:
+                    self._is_dragging = True
 
-    def _get_patrol_scale(self) -> float:
-        return self._patrol_scale
+            if self._is_dragging:
+                parent = self.parentWidget()
+                if parent is not None:
+                    parent_pt = parent.mapFromGlobal(event.globalPosition().toPoint())
+                    new_x = parent_pt.x() - self._drag_offset.x()
+                    new_y = parent_pt.y() - self._drag_offset.y()
+                    max_x = max(0, parent.width() - self.width())
+                    max_y = max(0, parent.height() - self.height())
+                    self.move(max(0, min(new_x, max_x)), max(0, min(new_y, max_y)))
+                else:
+                    self.move(self.pos() + event.position().toPoint() - self._drag_offset)
+        super().mouseMoveEvent(event)
 
-    def _set_patrol_scale(self, value: float) -> None:
-        self._patrol_scale = float(value)
-        self.update()
+    def mouseReleaseEvent(self, event) -> None:
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        was_dragging = self._is_dragging
+        self._drag_offset = None
+        self._drag_start_global = None
+        self._is_dragging = False
 
-    patrol_scale = pyqtProperty(float, _get_patrol_scale, _set_patrol_scale)
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._check_collision():
+                self.capture()
+                return
+            elif was_dragging:
+                self.start_patrol()
+            else:
+                self.clicked.emit()
+                self.start_patrol()
+
+        super().mouseReleaseEvent(event)
+
+    def _check_collision(self) -> bool:
+        if self._bucket is None:
+            return False
+        pumpkin = getattr(self._bucket, "pumpkin_label", None) or getattr(self._bucket, "_pumpkin", None)
+        if pumpkin is None or not pumpkin.isVisible():
+            return False
+
+        ghost_rect = QRect(self.mapToGlobal(QPoint(0, 0)), self.size())
+        pumpkin_rect = QRect(pumpkin.mapToGlobal(QPoint(0, 0)), pumpkin.size())
+        return ghost_rect.intersects(pumpkin_rect.adjusted(-12, -12, 12, 12))
+
+    def capture(self) -> None:
+        self._is_captured = True
+        self.stop_patrol()
+        self.hide()
+        if self._bucket is not None:
+            self._bucket.set_contained(True)
+            self._bucket.shake()
+        self.captured.emit()
+        QTimer.singleShot(random.randint(1000, 20000), self.escape)
+
+    def escape(self) -> None:
+        if not self._is_captured:
+            return
+        self._is_captured = False
+
+        parent = self.parentWidget()
+        if parent is not None:
+            max_x = max(0, parent.width() - self.width())
+            max_y = max(0, parent.height() - self.height())
+            rand_x = random.randint(0, max_x)
+            rand_y = random.randint(0, max_y)
+            self.move(rand_x, rand_y)
+
+        self.show()
+        self.raise_()
+
+        if self._bucket is not None:
+            self._bucket.set_contained(False)
+
+        self.escaped.emit()
+        self.start_patrol()
 
     def start_patrol(self) -> None:
+        if self._is_captured:
+            return
         parent = self.parentWidget()
         if parent is None or parent.width() < 220 or parent.height() < 220:
             return
@@ -1824,17 +2133,20 @@ class FlyingKiro(QWidget):
                 max(0, min(y, height - self.height())),
             )
 
+        start_pt = self.pos()
+        if start_pt == QPoint(0, 0):
+            start_pt = point(0.10, 0.10)
+
         path = [
-            point(0.10, 0.10),
+            start_pt,
             point(0.58, 0.14),
             point(0.85, 0.38),
             point(0.62, 0.60),
             point(0.18, 0.78),
             point(0.06, 0.40),
             point(0.10, 0.10),
+            start_pt,
         ]
-        angles = (0.0, 6.0, -8.0, 4.0, -6.0, 3.0, 0.0)
-        scales = (1.0, 1.05, 0.95, 1.02, 0.97, 1.01, 1.0)
 
         if self._group is not None:
             self._group.stop()
@@ -1850,18 +2162,6 @@ class FlyingKiro(QWidget):
             movement.setKeyValueAt(index / (len(path) - 1), position)
         group.addAnimation(movement)
 
-        rotation = QPropertyAnimation(self, b"rotation", group)
-        rotation.setDuration(18000)
-        for index, angle in enumerate(angles):
-            rotation.setKeyValueAt(index / (len(angles) - 1), angle)
-        group.addAnimation(rotation)
-
-        scale = QPropertyAnimation(self, b"patrol_scale", group)
-        scale.setDuration(18000)
-        for index, factor in enumerate(scales):
-            scale.setKeyValueAt(index / (len(scales) - 1), factor)
-        group.addAnimation(scale)
-
         self._group = group
         self.show()
         self.raise_()
@@ -1872,67 +2172,58 @@ class FlyingKiro(QWidget):
             self._group.stop()
             self._group.deleteLater()
             self._group = None
-        if self._movie is not None:
-            self._movie.stop()
 
-    def paintEvent(self, event) -> None:
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        center = QPointF(self.width() / 2.0, 44.0)
-        aura = QRadialGradient(center, 48.0)
-        aura.setColorAt(0.0, QColor(57, 255, 20, 90))
-        aura.setColorAt(0.45, QColor(189, 0, 255, 85))
-        aura.setColorAt(1.0, QColor(255, 122, 0, 0))
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(aura)
-        painter.drawEllipse(center, 48.0, 48.0)
+FlyingKiro = DraggableGhost
 
-        painter.save()
-        painter.translate(center)
-        painter.rotate(self._rotation)
-        scaling = self._patrol_scale * self._hover_scale
-        painter.scale(scaling, scaling)
 
-        if self._movie is not None:
-            pixmap = self._movie.currentPixmap()
-            if not pixmap.isNull():
-                target = pixmap.scaled(
-                    78,
-                    78,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-                painter.drawPixmap(
-                    -target.width() // 2,
-                    -target.height() // 2,
-                    target,
-                )
-        else:
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor(57, 255, 20, 210))
-            painter.drawEllipse(QRectF(-28, -38, 56, 56))
-            painter.drawRect(QRectF(-28, -14, 56, 34))
-            painter.setBrush(QColor(11, 8, 19, 255))
-            painter.drawEllipse(QRectF(-16, -20, 9, 13))
-            painter.drawEllipse(QRectF(7, -20, 9, 13))
+class TraceBanner(QFrame):
+    cleared = pyqtSignal()
 
-        painter.restore()
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedHeight(28)
+        self.setVisible(False)
+        self.setStyleSheet(
+            _style(
+                "TraceBanner {"
+                " background: rgba(125, 233, 255, 24);"
+                " border-bottom: 1px solid @ICY@;"
+                "}"
+            )
+        )
 
-    def enterEvent(self, event) -> None:
-        self._hover_scale = 1.12
-        self.update()
-        super().enterEvent(event)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 0, 8, 0)
+        layout.setSpacing(6)
 
-    def leaveEvent(self, event) -> None:
-        self._hover_scale = 1.0
-        self.update()
-        super().leaveEvent(event)
+        self._label = _label("", C_ICY, 9, bold=True)
+        layout.addWidget(self._label, 1)
 
-    def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self.clicked.emit()
-        super().mousePressEvent(event)
+        close = QPushButton("✕")
+        close.setFixedSize(18, 18)
+        close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close.setToolTip("End bloodline trace")
+        close.setStyleSheet(
+            f"QPushButton {{ color: {C_ICY}; background: transparent;"
+            f" border: none; font-size: 11px; }}"
+            f"QPushButton:hover {{ color: {C_VOID}; background: {C_ICY};"
+            " border-radius: 3px; }"
+        )
+        close.clicked.connect(self.cleared.emit)
+        layout.addWidget(close)
+
+    def show_trace(
+        self, root: ProcessRow, count: int, leaking: bool
+    ) -> None:
+        suffix = " · LEAK IN LINEAGE" if leaking else ""
+        self._label.setText(
+            f"BLOODLINE: {root.name} (PID {root.pid}) · {count} kin{suffix}"
+        )
+        self.setVisible(True)
+
+    def clear_trace(self) -> None:
+        self.setVisible(False)
 
 
 class GtopWindow(QMainWindow):
@@ -1951,6 +2242,8 @@ class GtopWindow(QMainWindow):
         self._ambient_whisper = ""
         self._shake_animation: QPropertyAnimation | None = None
         self._shortcuts: list[QShortcut] = []
+        self._cursed_pids: set[int] = set()
+        self._trace_root: int | None = None
 
         root = QWidget(self)
         root.setObjectName("gtopRoot")
@@ -2012,6 +2305,7 @@ class GtopWindow(QMainWindow):
         gauges_layout.addWidget(self.cpu_card, 1)
         gauges_layout.addWidget(self.ram_card, 1)
 
+        self.trace = TraceBanner()
         self.table = ProcessTable()
         self.crypt = CryptPanel()
         self.footer = FooterBar()
@@ -2020,16 +2314,18 @@ class GtopWindow(QMainWindow):
         frame_layout.addWidget(self.banner)
         frame_layout.addWidget(self.mascot_panel)
         frame_layout.addWidget(gauges)
+        frame_layout.addWidget(self.trace)
         frame_layout.addWidget(self.table, 1)
         frame_layout.addWidget(self.crypt)
         frame_layout.addWidget(self.footer)
 
         self._decor = DecorOverlay(self._frame)
         self._swarm = GhostSwarm(self._frame)
-        self._flyer = FlyingKiro(self._frame)
+        self._flyer = DraggableGhost(self._frame, bucket=self.banner)
         self._decor.setGeometry(self._frame.rect())
         self._swarm.setGeometry(self._frame.rect())
         self._decor.raise_()
+        self._flyer.raise_()
 
         self._wire_events()
         self._install_shortcuts()
@@ -2064,7 +2360,7 @@ class GtopWindow(QMainWindow):
         self._worker = SnapshotWorker(self)
         self._worker.snapshot_ready.connect(self._apply_snapshot)
         self._worker.start()
-        self._audio.play("Possessed_High_Score.mp3", 0.25)
+        self._audio.play_loop("Possessed_High_Score.mp3", 0.25)
 
 
         QTimer.singleShot(250, self._refresh_audio_status)
@@ -2077,17 +2373,22 @@ class GtopWindow(QMainWindow):
         self.banner.spook_requested.connect(self.spook)
         self.banner.bucket_clicked.connect(self._on_bucket)
         self._flyer.clicked.connect(self._on_flying_kiro)
+        self._flyer.captured.connect(self._on_ghost_captured)
+        self._flyer.escaped.connect(self._on_ghost_escaped)
         self.mascot_panel.mascot_clicked.connect(self.cycle_taunt)
         self.mascot_panel.poke_requested.connect(self.cycle_taunt)
         self.table.kill_requested.connect(self._exorcise)
         self.crypt.resurrect_requested.connect(self._on_resurrect)
+        self.trace.cleared.connect(self._clear_trace)
 
     def _install_shortcuts(self) -> None:
         bindings = (
             ("k", self._exorcise_selected),
+            ("c", self._toggle_curse),
             ("r", self._resurrect_selected),
             ("s", self.spook),
             ("m", self._toggle_mute),
+            ("Shift+T", self._toggle_trace),
             ("q", self.close),
             ("Escape", self.close),
             ("Up", lambda: self.table.move_selection(-1)),
@@ -2104,7 +2405,7 @@ class GtopWindow(QMainWindow):
         self._snapshot = snapshot
 
         self.header.set_metrics(snapshot.cpu_total, snapshot.mem_percent)
-        self.table.update_rows(snapshot.processes)
+        self._refresh_table()
 
         cores = snapshot.core_count or (psutil.cpu_count(logical=True) or 0)
         cpu_status = (
@@ -2132,11 +2433,165 @@ class GtopWindow(QMainWindow):
         if time.monotonic() >= self._taunt_hold_until:
             self._update_snapshot_taunt(snapshot)
 
+    def _refresh_table(self) -> None:
+        traced = self._trace_rows()
+        if traced is None:
+            if self._trace_root is not None:
+                self._trace_root = None
+                self.trace.clear_trace()
+            self.table.update_rows(
+                self._snapshot.processes,
+                cursed_pids=self._cursed_pids,
+            )
+            return
+
+        processes = [row for row, _depth in traced]
+        depths = {row.pid: depth for row, depth in traced}
+        branch = self._leak_branch({row.pid for row in processes})
+        self.table.update_rows(
+            processes,
+            cursed_pids=self._cursed_pids,
+            depths=depths,
+            branch_pids=branch,
+        )
+        leaking = self._snapshot.leak_pid in {row.pid for row in processes}
+        self.trace.show_trace(traced[0][0], max(0, len(processes) - 1), leaking)
+
+    def _trace_rows(self) -> list[tuple[ProcessRow, int]] | None:
+        if self._trace_root is None:
+            return None
+
+        processes = self._snapshot.all_processes
+        by_pid = {row.pid: row for row in processes}
+        root = by_pid.get(self._trace_root)
+        if root is None:
+            return None
+
+        children: dict[int, list[ProcessRow]] = {}
+        for row in processes:
+            children.setdefault(row.ppid, []).append(row)
+
+        ordered: list[tuple[ProcessRow, int]] = []
+
+        def walk(node: ProcessRow, depth: int) -> None:
+            if len(ordered) >= TRACE_MAX_ROWS:
+                return
+            ordered.append((node, depth))
+            for child in sorted(
+                children.get(node.pid, []),
+                key=lambda row: (-row.cpu, -row.mem),
+            ):
+                walk(child, depth + 1)
+
+        walk(root, 0)
+        return ordered
+
+    def _leak_branch(self, visible_pids: set[int]) -> set[int]:
+        leak_pid = self._snapshot.leak_pid
+        if leak_pid is None or self._trace_root is None:
+            return set()
+        if leak_pid not in visible_pids:
+            return set()
+
+        by_pid = {row.pid: row for row in self._snapshot.all_processes}
+        branch: set[int] = set()
+        cursor: int | None = leak_pid
+        while cursor is not None and cursor not in branch:
+            branch.add(cursor)
+            if cursor == self._trace_root:
+                break
+            node = by_pid.get(cursor)
+            if node is None:
+                break
+            cursor = node.ppid
+        return branch
+
+    def _toggle_trace(self) -> None:
+        pid = self.table.selected_pid()
+        if pid is None:
+            self._set_taunt(
+                "NO BLOODLINE",
+                '"Select a spirit before tracing its kin."',
+                "PATIENT",
+                C_DIM,
+                3.0,
+            )
+            return
+
+        if self._trace_root == pid:
+            self._clear_trace()
+            return
+
+        by_pid = {row.pid: row for row in self._snapshot.all_processes}
+        root = by_pid.get(pid)
+        if root is None:
+            self._set_taunt(
+                "ALREADY GONE",
+                f'"PID {pid} has no bloodline left to trace."',
+                "VANISHED",
+                C_DIM,
+                3.0,
+            )
+            return
+
+        self._trace_root = pid
+        self._audio.play("collected.wav", 0.35)
+        self._set_taunt(
+            "BLOODLINE TRACED",
+            f'"The kin of {root.name} reveal themselves. Follow the leaking branch."',
+            "BOUND",
+            C_ICY,
+            5.0,
+        )
+        self._refresh_table()
+
+    def _clear_trace(self) -> None:
+        if self._trace_root is None and not self.trace.isVisible():
+            return
+        self._trace_root = None
+        self.trace.clear_trace()
+        self._refresh_table()
+        self._set_taunt(
+            "BLOODLINE SEVERED",
+            '"The lineage fades back into the mist."',
+            "RELEASED",
+            C_DIM,
+            3.0,
+        )
+
     def _update_snapshot_taunt(self, snapshot: SystemSnapshot) -> None:
         if snapshot.zombie_pids:
             pid = snapshot.zombie_pids[0]
             text = random.choice(_TAUNTS["zombie"]).format(pid=pid)
             self._set_taunt("ZOMBIE DETECTED", text, "ROAMING", C_PURPLE, 5.0)
+        elif (
+            snapshot.leak_pid is not None
+            and snapshot.leak_growth >= LEAK_GROWTH_MB
+        ):
+            leak = next(
+                (
+                    row
+                    for row in snapshot.all_processes
+                    if row.pid == snapshot.leak_pid
+                ),
+                None,
+            )
+            if leak is not None:
+                self._set_taunt(
+                    "BLOODLINE LEAK",
+                    f'"PID {leak.pid} — {leak.name} is swelling with stolen souls'
+                    f' (+{snapshot.leak_growth:.0f} MB, now {leak.rss_mb:.0f} MB)."',
+                    "SWELLING",
+                    C_PURPLE,
+                    5.0,
+                )
+            else:
+                self._set_taunt(
+                    "IDLE",
+                    random.choice(_TAUNTS["idle"]),
+                    "WATCHFUL",
+                    C_DIM,
+                )
         elif snapshot.top_cpu is not None and snapshot.top_cpu.cpu >= CPU_SPIKE:
             proc = snapshot.top_cpu
             text = random.choice(_TAUNTS["cpu"]).format(
@@ -2149,6 +2604,18 @@ class GtopWindow(QMainWindow):
                 name=proc.name, mem=proc.mem
             )
             self._set_taunt("RAM GLUTTON DETECTED", text, "FEASTING", C_GREEN)
+        elif snapshot.squatter_count:
+            squatters = [row for row in snapshot.all_processes if row.squatter][:3]
+            names = ", ".join(
+                f"{row.name}:{row.haunted_ports[0]}" for row in squatters
+            )
+            self._set_taunt(
+                "PORT HAUNTING",
+                f'"Something is squatting on your ports: {names}."',
+                "LISTENING",
+                C_ORANGE,
+                5.0,
+            )
         else:
             self._set_taunt(
                 "IDLE",
@@ -2197,14 +2664,24 @@ class GtopWindow(QMainWindow):
     def _on_bucket(self) -> None:
         self.banner.shake()
         self._audio.play("collected.wav", 0.4)
-        self._swarm.burst(3)
-        self._set_taunt(
-            "SOUL CANDY BUCKET",
-            '"The bucket rattles. The souls are restless tonight."',
-            "HUNGRY",
-            C_ORANGE,
-            4.0,
-        )
+        if getattr(self.banner, "_is_contained", False):
+            self._set_taunt(
+                "SOUL CONTAINED",
+                '"The bucket rattles violently! A captured soul is thrashing against the lid."',
+                "THRASHING",
+                C_PURPLE,
+                4.0,
+            )
+        else:
+            self.banner.add_treats(1)
+            self._swarm.burst(3)
+            self._set_taunt(
+                "SOUL CANDY BUCKET",
+                '"The bucket rattles. The souls are restless tonight."',
+                "HUNGRY",
+                C_ORANGE,
+                4.0,
+            )
 
     def _on_flying_kiro(self) -> None:
         self.banner.add_treats(3)
@@ -2217,6 +2694,106 @@ class GtopWindow(QMainWindow):
             C_GREEN,
             4.0,
         )
+
+    def _on_ghost_captured(self) -> None:
+        self._audio.play("exorcism1.wav", 0.55)
+        self.banner.shake()
+        self._swarm.burst(6)
+        self._set_taunt(
+            "SOUL CONTAINED",
+            '"You dragged the wandering ghost into the candy bucket! Contained... for now."',
+            "CONTAINED",
+            C_PURPLE,
+            4.0,
+        )
+
+    def _on_ghost_escaped(self) -> None:
+        self._audio.play("ghost_scream.wav", 0.55)
+        self.banner.shake()
+        self._swarm.burst(8)
+        self._set_taunt(
+            "GHOST ESCAPED",
+            '"HEE HEE! The seal breaks! Kiro slips free back into the mist."',
+            "FREE",
+            C_GREEN,
+            4.0,
+        )
+
+    def _toggle_curse(self) -> None:
+        pid = self.table.selected_pid()
+        if pid is None:
+            self._set_taunt(
+                "NO SPIRIT SELECTED",
+                '"Choose a row to curse first, mortal."',
+                "PATIENT",
+                C_DIM,
+                3.0,
+            )
+            return
+
+        if pid in (0, 1, os.getpid()):
+            self._set_taunt(
+                "FORBIDDEN RITUAL",
+                '"That soul is bound to the living world."',
+                "SEALED",
+                C_PURPLE,
+                4.0,
+            )
+            return
+
+        try:
+            process = psutil.Process(pid)
+            name = process.name() or f"pid-{pid}"
+            if pid in self._cursed_pids:
+                process.resume()
+                self._cursed_pids.discard(pid)
+                self._audio.play("collected.wav", 0.4)
+                self._set_taunt(
+                    "UNCURSED",
+                    f'"PID {pid} — {name} lurches back into motion."',
+                    "RELEASED",
+                    C_GREEN,
+                    4.0,
+                )
+            else:
+                process.suspend()
+                self._cursed_pids.add(pid)
+                self._audio.play("exorcism2.wav", 0.4)
+                self._set_taunt(
+                    "CURSED",
+                    f'"PID {pid} — {name} is frozen mid-scream."',
+                    "BOUND",
+                    C_ICY,
+                    4.0,
+                )
+        except psutil.NoSuchProcess:
+            self._cursed_pids.discard(pid)
+            self._set_taunt(
+                "ALREADY GONE",
+                f'"PID {pid} was already a ghost."',
+                "VANISHED",
+                C_DIM,
+                3.0,
+            )
+        except psutil.AccessDenied:
+            self._set_taunt(
+                "RESISTANCE",
+                '"The spirit resists your icy grip."',
+                "SHIELDED",
+                C_PURPLE,
+                4.0,
+            )
+        except Exception as exc:
+            self._cursed_pids.discard(pid)
+            self._set_taunt(
+                "HEX FAILED",
+                f'"The ritual fizzled: {type(exc).__name__}."',
+                "UNSTABLE",
+                C_DIM,
+                4.0,
+            )
+        else:
+            self.table.set_cursed_pids(self._cursed_pids)
 
     def _exorcise_selected(self) -> None:
         pid = self.table.selected_pid()
@@ -2245,6 +2822,11 @@ class GtopWindow(QMainWindow):
         try:
             process = psutil.Process(pid)
             name = process.name() or f"pid-{pid}"
+            if pid in self._cursed_pids:
+                with contextlib.suppress(Exception):
+                    process.resume()
+                self._cursed_pids.discard(pid)
+                self.table.set_cursed_pids(self._cursed_pids)
             process.terminate()
             self.crypt.add_entry(pid, name, "SIGTERM")
             self.banner.add_treats(1)
@@ -2364,6 +2946,14 @@ class GtopWindow(QMainWindow):
         self._flyer.start_patrol()
 
     def closeEvent(self, event) -> None:
+        # Never leave a suspended process behind: release every curse on exit.
+        for pid in list(self._cursed_pids):
+            try:
+                psutil.Process(pid).resume()
+            except Exception:
+                pass
+        self._cursed_pids.clear()
+
         try:
             self._worker.stop()
         except Exception:
@@ -2377,12 +2967,9 @@ class GtopWindow(QMainWindow):
         except Exception:
             pass
         try:
-            if self.mascot_panel.mascot._movie is not None:
-                self.mascot_panel.mascot._movie.stop()
-        except Exception:
-            pass
-        try:
             self._flyer.stop_patrol()
+            if getattr(self._flyer, "_movie", None) is not None:
+                self._flyer._movie.stop()
         except Exception:
             pass
         try:

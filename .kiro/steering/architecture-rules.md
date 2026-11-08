@@ -20,3 +20,18 @@ When generating or refactoring code for SpookCLI / gtop, you MUST adhere to the 
 4. **Design Assets:**
    - Use local files from `spookcli/assets/` so they ship inside the wheel. The gtop mascot prefers `blinking_ghost.gif` and falls back to `ghost-kiro-blink.gif`, then a procedural ghost.
    - Implement only the left-hand gtop application panel. The right-hand Audio & Interaction Blueprint HUD is excluded.
+
+5. **Process Control Safety:**
+   - Exorcise (`SIGTERM`) must refuse PID `0`, PID `1`, and `os.getpid()`. The same guard applies to Curse (`SIGSTOP`).
+   - Curse state lives in `GtopWindow._cursed_pids`. Every path that removes a curse (toggle, exorcise, window close) must call `resume()` inside try/except.
+   - `closeEvent` MUST resume all cursed PIDs before stopping the snapshot worker, or the user is left with a frozen process.
+   - A cursed process must be resumed before `terminate()`; `SIGTERM` is not delivered while the process is stopped.
+
+6. **Port Telemetry:**
+   - Port mapping uses `psutil.net_connections(kind="inet")` only. Never shell out to `lsof`, `ss`, or `netstat`.
+   - `net_connections` commonly raises `AccessDenied` on Windows and restricted Linux; treat that as "no ports", never as a fatal error.
+   - Only the curated `HAUNTED_PORTS` set earns a squatter badge, so system listeners like sshd are not mislabelled.
+
+7. **Leak Heuristics:**
+   - RSS history is owned by `SnapshotWorker`, not the GUI thread.
+   - Growth detection wins over the highest-RSS fallback. Only growth-based leaks may drive mascot taunts.
