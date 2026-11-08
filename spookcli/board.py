@@ -13,17 +13,13 @@ Public API (called by cli.py and ghost.py):
 from __future__ import annotations
 
 import json
-import os
 import random
 import re
 import sys
 import time
-from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-import click
 
 # Force UTF-8 on Windows so box-drawing characters don't crash on cp1252.
 if sys.platform == "win32":
@@ -286,8 +282,7 @@ def _centred(text: str, w: int, colour: str = "") -> str:
     """Return *text* centre-aligned in *w-2* columns with optional colour."""
     plain = re.sub(r"\x1b\[[0-9;]*m", "", text)
     total_pad = w - 2 - len(plain)
-    left  = total_pad // 2
-    right = total_pad - left
+    left = total_pad // 2
     return _box_row(f"{' ' * left}{colour}{text}{_RESET}", w)
 
 

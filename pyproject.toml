@@ -1,22 +1,71 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
 name = "spookcli"
-version = "0.1.0"
-description = "🎃 A Halloween-themed CLI wrapper that summons ghosts on failure"
+dynamic = ["version"]
+description = "A Halloween-themed CLI that summons a ghost when your command fails, plus gtop, a haunted process monitor with port hauntings, curse/uncurse, and bloodline leak tracing."
 readme = "README.md"
-requires-python = ">=3.10"
-dependencies = [
-    "click==8.1.8",
-    "pygame==2.6.1",
-    "PyQt6==6.8.1",
-    "psutil==6.1.1",
+requires-python = ">=3.10,<3.14"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Jayaditya" }]
+keywords = ["halloween", "cli", "process-monitor", "pyqt6", "psutil", "kiro"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Monitoring",
+    "Topic :: System :: Systems Administration",
+    "Topic :: Utilities",
 ]
+dependencies = [
+    "click>=8.1,<9",
+    "pygame>=2.6,<3",
+    "PyQt6>=6.8,<7",
+    "psutil>=6.1,<8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "build>=1.2",
+    "twine>=5",
+    "pytest>=8",
+    "pyflakes>=3.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/saveduser/spook-cli"
+Repository = "https://github.com/saveduser/spook-cli"
+Issues = "https://github.com/saveduser/spook-cli/issues"
+Changelog = "https://github.com/saveduser/spook-cli/blob/main/CHANGELOG.md"
 
 [project.scripts]
 spook = "spookcli.cli:main"
 
+[tool.hatch.version]
+path = "spookcli/__init__.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["spookcli"]
+
+[tool.hatch.build.targets.sdist]
+exclude = [
+    ".kiro",
+    ".github",
+    "docs",
+    "demonstration.md",
+    "opencode.json",
+    "tests",
+    "scripts",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

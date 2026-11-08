@@ -1,27 +1,34 @@
 # 🎃 SpookCLI
 
-> A Halloween-themed CLI wrapper that summons ghosts when your commands fail.
+[![PyPI](https://img.shields.io/pypi/v/spookcli.svg)](https://pypi.org/project/spookcli/)
+[![Python versions](https://img.shields.io/pypi/pyversions/spookcli.svg)](https://pypi.org/project/spookcli/)
+[![CI](https://github.com/saveduser/spook-cli/actions/workflows/ci.yml/badge.svg)](https://github.com/saveduser/spook-cli/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://github.com/saveduser/spook-cli/blob/main/LICENSE)
 
-## Quick Start
+> A Halloween-themed CLI that summons ghosts when your commands fail — with
+> **gtop**, a live haunted process monitor underneath.
 
-```powershell
-# 1. Create an isolated virtual environment with uv
-cd spookcli
-uv venv
+## Install
 
-# 2. Activate it (PowerShell)
-.\.venv\Scripts\Activate.ps1
-# Linux / macOS
-source .venv/bin/activate
+```bash
+pipx install spookcli   # recommended: isolated CLI install
+# or
+pip install spookcli
+```
 
+Requires **Python 3.10–3.13**. On Linux, install the audio and emoji runtime
+libraries:
 
-# 3. Install the project and its dependencies
-uv pip install -e .
+```bash
+sudo apt install libpulse0 fonts-noto-color-emoji
+```
 
-# 4. Run a command through SpookCLI
-spook run echo "hello world"            # success  ✅
-spook run python -c "import sys; sys.exit(1)"   # failure 💀
-spook gtop                              # haunted process monitor
+Then:
+
+```bash
+spook run echo "hello world"                    # success  ✅
+spook run python -c "import sys; sys.exit(1)"   # failure  💀
+spook gtop                                      # haunted process monitor
 ```
 
 ## Usage
@@ -29,11 +36,25 @@ spook gtop                              # haunted process monitor
 ```
 spook run <command> [args...]
 spook gtop
+spook board
+spook install-hook
+spook test-ghost
+```
+
+## Development install
+
+```bash
+git clone https://github.com/saveduser/spook-cli
+cd spook-cli
+uv venv
+source .venv/bin/activate        # Windows: .\.venv\Scripts\Activate.ps1
+uv pip install -e ".[dev]"
+pytest -q
 ```
 
 ## 🩸 gtop — Haunted Process Monitor
 
-![gtop — Haunted Process Monitor](docs/screenshots/gtop.png)
+![gtop — Haunted Process Monitor](https://raw.githubusercontent.com/saveduser/spook-cli/main/docs/screenshots/gtop.png)
 
 `spook gtop` opens a frameless, glassmorphic PyQt6 monitor that streams live
 `psutil` telemetry into a haunted process table. It is not a screenshot: the
@@ -66,13 +87,18 @@ gauges, process rows, mascot, candy bucket, and flying Kiro all run live.
 
 ```
 spookcli/
-├── pyproject.toml          # project metadata & dependencies
+├── pyproject.toml          # project metadata, dependencies, build config
 ├── README.md
+├── CHANGELOG.md
+├── ASSETS.md               # provenance and licensing notes for bundled media
+├── LICENSE
+├── .github/workflows/      # CI + Trusted Publishing release pipelines
+├── tests/                  # pytest suite (CLI, assets, gtop smoke)
 └── spookcli/
-    ├── __init__.py
-    ├── cli.py              # click entrypoint — `spook run`, `spook gtop`
+    ├── __init__.py         # __version__ — single source of truth
+    ├── cli.py              # click entrypoint — run, gtop, board, hooks
     ├── runner.py           # subprocess wrapper, real-time streaming
-    ├── board.py            # scoreboard and kill ledger
+    ├── board.py            # BBS scoreboard and kill ledger
     ├── ghost.py            # ghost event audio + Qt overlay
     ├── gtop.py             # PyQt6 haunted process monitor
     ├── whispers.py         # rotating Kiro prophecies
@@ -111,12 +137,15 @@ UI still renders without emoji fonts.
 
 ## Dependencies
 
-| Package | Version | Purpose |
-|---|---|---|
-| `click` | 8.1.8 | CLI parsing, coloured output |
-| `pygame` | 2.6.1 | Optional audio playback |
-| `PyQt6` | 6.8.1 | `gtop` and ghost overlay |
-| `psutil` | 6.1.1 | Process, memory, and port telemetry |
+| Package | Constraint | Tested | Purpose |
+|---|---|---|---|
+| `click` | `>=8.1,<9` | 8.1.8 | CLI parsing, coloured output |
+| `pygame` | `>=2.6,<3` | 2.6.1 | Optional audio playback |
+| `PyQt6` | `>=6.8,<7` | 6.8.1 | `gtop` and ghost overlay |
+| `psutil` | `>=6.1,<8` | 6.1.1 | Process, memory, and port telemetry |
+
+Python support is pinned to `>=3.10,<3.14` because the tested PyQt6 and pygame
+releases publish wheels for CPython 3.10 through 3.13.
 
 ## 🧛 Built with Kiro
 
@@ -136,6 +165,6 @@ afterthought:
 The `gtop` UI was specified in Kiro and implemented against those steering
 rules; the Stitch MCP design reference is recorded in the spec.
 
-See [`docs/kiro-usage.md`](docs/kiro-usage.md) for the concrete build story:
+See [`docs/kiro-usage.md`](https://github.com/saveduser/spook-cli/blob/main/docs/kiro-usage.md) for the concrete build story:
 which specs drove which files, which steering rules changed the output, and how
 the hooks and MCP server were used.

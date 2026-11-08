@@ -32,6 +32,7 @@ from pathlib import Path
 
 import click
 
+from spookcli import __version__
 from spookcli.ghost import trigger_ghost_event
 from spookcli.runner import run_command
 
@@ -144,6 +145,7 @@ PROMPT_COMMAND="${{PROMPT_COMMAND:+${{PROMPT_COMMAND}}; }}_spookcli_prompt_cmd"
 # ---------------------------------------------------------------------------
 
 @click.group()
+@click.version_option(version=__version__, prog_name="spook")
 def main() -> None:
     """SpookCLI -- a Halloween-themed command wrapper."""
 
@@ -323,15 +325,15 @@ def install_hook(shell: str, dry_run: bool) -> None:
         sys.exit(1)
 
     # ── success message ──────────────────────────────────────────────────
-    click.echo(click.style(f"[SpookCLI] Hook installed successfully!", **SUCCESS_STYLE))
+    click.echo(click.style("[SpookCLI] Hook installed successfully!", **SUCCESS_STYLE))
     click.echo(click.style(f"  Profile : {profile_path}", **INFO_STYLE))
     click.echo(click.style(f"  Shell   : {shell}", **INFO_STYLE))
     click.echo(click.style(f"  Spook   : {spook_exe}", **INFO_STYLE))
     click.echo("")
     click.echo(click.style("Next steps:", bold=True))
     click.echo(f"  1. Reload your shell config:  {reload_hint}")
-    click.echo(f"  2. Run any failing command — the ghost will appear automatically.")
-    click.echo(f"  3. To remove the hook, delete the lines between")
+    click.echo("  2. Run any failing command — the ghost will appear automatically.")
+    click.echo("  3. To remove the hook, delete the lines between")
     click.echo(f"     '{_HOOK_MARKER}' and '{_HOOK_MARKER} end' in {profile_path}")
 
 

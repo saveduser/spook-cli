@@ -1,3 +1,10 @@
 .venv
 __pycache__/
 opencode.json
+dist/
+build/
+*.egg-info/
+*.whl
+*.tar.gz
+.pytest_cache/
+.ruff_cache/
