@@ -33,6 +33,8 @@ spook gtop
 
 ## 🩸 gtop — Haunted Process Monitor
 
+![gtop — Haunted Process Monitor](docs/screenshots/gtop.png)
+
 `spook gtop` opens a frameless, glassmorphic PyQt6 monitor that streams live
 `psutil` telemetry into a haunted process table. It is not a screenshot: the
 gauges, process rows, mascot, candy bucket, and flying Kiro all run live.
@@ -133,3 +135,7 @@ afterthought:
 
 The `gtop` UI was specified in Kiro and implemented against those steering
 rules; the Stitch MCP design reference is recorded in the spec.
+
+See [`docs/kiro-usage.md`](docs/kiro-usage.md) for the concrete build story:
+which specs drove which files, which steering rules changed the output, and how
+the hooks and MCP server were used.
