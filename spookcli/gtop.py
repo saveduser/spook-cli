@@ -2741,33 +2741,20 @@ class GtopWindow(QMainWindow):
             )
             return
 
+        # Keep the psutil call and the bookkeeping in one narrow block: if the
+        # suspend/resume raises, the cursed set must not drift out of sync with
+        # the real process state.
+        uncursing = pid in self._cursed_pids
         try:
             process = psutil.Process(pid)
             name = process.name() or f"pid-{pid}"
-            if pid in self._cursed_pids:
+            if uncursing:
                 process.resume()
-                self._cursed_pids.discard(pid)
-                self._audio.play("collected.wav", 0.4)
-                self._set_taunt(
-                    "UNCURSED",
-                    f'"PID {pid} — {name} lurches back into motion."',
-                    "RELEASED",
-                    C_GREEN,
-                    4.0,
-                )
             else:
                 process.suspend()
-                self._cursed_pids.add(pid)
-                self._audio.play("exorcism2.wav", 0.4)
-                self._set_taunt(
-                    "CURSED",
-                    f'"PID {pid} — {name} is frozen mid-scream."',
-                    "BOUND",
-                    C_ICY,
-                    4.0,
-                )
         except psutil.NoSuchProcess:
             self._cursed_pids.discard(pid)
+            self.table.set_cursed_pids(self._cursed_pids)
             self._set_taunt(
                 "ALREADY GONE",
                 f'"PID {pid} was already a ghost."',
@@ -2775,6 +2762,7 @@ class GtopWindow(QMainWindow):
                 C_DIM,
                 3.0,
             )
+            return
         except psutil.AccessDenied:
             self._set_taunt(
                 "RESISTANCE",
@@ -2783,8 +2771,8 @@ class GtopWindow(QMainWindow):
                 C_PURPLE,
                 4.0,
             )
+            return
         except Exception as exc:
-            self._cursed_pids.discard(pid)
             self._set_taunt(
                 "HEX FAILED",
                 f'"The ritual fizzled: {type(exc).__name__}."',
@@ -2792,8 +2780,32 @@ class GtopWindow(QMainWindow):
                 C_DIM,
                 4.0,
             )
+            return
+
+        if uncursing:
+            self._cursed_pids.discard(pid)
         else:
-            self.table.set_cursed_pids(self._cursed_pids)
+            self._cursed_pids.add(pid)
+        self.table.set_cursed_pids(self._cursed_pids)
+
+        if uncursing:
+            self._audio.play("collected.wav", 0.4)
+            self._set_taunt(
+                "UNCURSED",
+                f'"PID {pid} — {name} lurches back into motion."',
+                "RELEASED",
+                C_GREEN,
+                4.0,
+            )
+        else:
+            self._audio.play("exorcism2.wav", 0.4)
+            self._set_taunt(
+                "CURSED",
+                f'"PID {pid} — {name} is frozen mid-scream."',
+                "BOUND",
+                C_ICY,
+                4.0,
+            )
 
     def _exorcise_selected(self) -> None:
         pid = self.table.selected_pid()
@@ -2823,25 +2835,13 @@ class GtopWindow(QMainWindow):
             process = psutil.Process(pid)
             name = process.name() or f"pid-{pid}"
             if pid in self._cursed_pids:
+                # SIGTERM is not delivered while the process is stopped.
                 with contextlib.suppress(Exception):
                     process.resume()
-                self._cursed_pids.discard(pid)
-                self.table.set_cursed_pids(self._cursed_pids)
             process.terminate()
-            self.crypt.add_entry(pid, name, "SIGTERM")
-            self.banner.add_treats(1)
-            self._audio.play(
-                random.choice(["exorcism1.wav", "exorcism2.wav"]), 0.6
-            )
-            self._set_taunt(
-                "EXORCISED",
-                f'"PID {pid} — {name} has been cast into the crypt."',
-                "SLAIN",
-                C_ORANGE,
-                4.0,
-            )
-            self._swarm.burst(4)
         except psutil.NoSuchProcess:
+            self._cursed_pids.discard(pid)
+            self.table.set_cursed_pids(self._cursed_pids)
             self._set_taunt(
                 "ALREADY GONE",
                 f'"PID {pid} was already a ghost."',
@@ -2849,6 +2849,7 @@ class GtopWindow(QMainWindow):
                 C_DIM,
                 3.0,
             )
+            return
         except psutil.AccessDenied:
             self._set_taunt(
                 "RESISTANCE",
@@ -2857,6 +2858,7 @@ class GtopWindow(QMainWindow):
                 C_PURPLE,
                 4.0,
             )
+            return
         except Exception as exc:
             self._set_taunt(
                 "HEX FAILED",
@@ -2865,6 +2867,23 @@ class GtopWindow(QMainWindow):
                 C_DIM,
                 4.0,
             )
+            return
+
+        self._cursed_pids.discard(pid)
+        self.table.set_cursed_pids(self._cursed_pids)
+        self.crypt.add_entry(pid, name, "SIGTERM")
+        self.banner.add_treats(1)
+        self._audio.play(
+            random.choice(["exorcism1.wav", "exorcism2.wav"]), 0.6
+        )
+        self._set_taunt(
+            "EXORCISED",
+            f'"PID {pid} — {name} has been cast into the crypt."',
+            "SLAIN",
+            C_ORANGE,
+            4.0,
+        )
+        self._swarm.burst(4)
 
     def _resurrect_selected(self) -> None:
         self.crypt.resurrect_latest()
