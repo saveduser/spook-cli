@@ -42,7 +42,7 @@ gauges, process rows, mascot, candy bucket, and flying Kiro all run live.
 | Feature | What it does |
 |---|---|
 | **Port Hauntings** | Maps listening TCP ports to their owning PIDs. Holders of `8080`, `3000`, or `5432` (plus `8000`, `5173`, `3306`, `6379`) get a port badge and an always-visible ☠ button for one-click Exorcise. |
-| **Curse / Uncurse** | `c` suspends the selected process (`SIGSTOP`) and paints its row icy blue; pressing `c` again resumes it (`SIGCONT`). Exiting `gtop` automatically resumes every cursed process. PID `0`, `1`, and `gtop` itself are protected. |
+| **Curse / Uncurse** | `c` suspends the selected process (`SIGSTOP`) and paints its row icy blue; pressing `c` again resumes it (`SIGCONT`). Cursed rows stay pinned at the top so the curse can always be lifted, and exiting `gtop` automatically resumes every cursed process. PID `0`, `1`, and `gtop` itself are protected. |
 | **Trace Bloodline** | `Shift+T` expands the selected process into its full descendant tree, indented by generation. The leaking branch is highlighted, and the suspected leak carries a `LEAK` tag. |
 | **Bloodline leak detection** | Tracks RSS growth across recent snapshots and flags the fastest-growing process; falls back to the largest resident process when nothing is visibly climbing. |
 | **Soul gauges** | Live CPU (`CORE HEAT`) and RAM (`SOUL POOL`) bars with animated fills and overflow states. |

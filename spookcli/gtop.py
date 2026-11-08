@@ -2440,7 +2440,7 @@ class GtopWindow(QMainWindow):
                 self._trace_root = None
                 self.trace.clear_trace()
             self.table.update_rows(
-                self._snapshot.processes,
+                self._visible_rows(),
                 cursed_pids=self._cursed_pids,
             )
             return
@@ -2456,6 +2456,27 @@ class GtopWindow(QMainWindow):
         )
         leaking = self._snapshot.leak_pid in {row.pid for row in processes}
         self.trace.show_trace(traced[0][0], max(0, len(processes) - 1), leaking)
+
+    def _visible_rows(self) -> list[ProcessRow]:
+        """Pin cursed rows to the top.
+
+        A suspended process drops to 0% CPU, so the normal CPU/memory sort can
+        push it out of the visible MAX_PROCS window. Cursed rows must stay
+        reachable, otherwise the user cannot lift the curse without exiting.
+        """
+        if not self._cursed_pids:
+            return self._snapshot.processes
+
+        by_pid = {row.pid: row for row in self._snapshot.all_processes}
+        cursed = [
+            by_pid[pid] for pid in sorted(self._cursed_pids) if pid in by_pid
+        ]
+        rest = [
+            row
+            for row in self._snapshot.processes
+            if row.pid not in self._cursed_pids
+        ]
+        return cursed + rest
 
     def _trace_rows(self) -> list[tuple[ProcessRow, int]] | None:
         if self._trace_root is None:

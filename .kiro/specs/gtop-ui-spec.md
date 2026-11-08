@@ -56,6 +56,7 @@ A frameless, glassmorphic desktop process monitor driven by live `psutil` teleme
 - `c` toggles `psutil.Process.suspend()` / `.resume()` for the selected process.
 - Cursed rows use the icy accent `#7DE9FF` for the background tint, left border, PID, name, and dot, and show a `(cursed)` tag.
 - Cursed PIDs live in `GtopWindow._cursed_pids`; the set is pushed into `ProcessTable.set_cursed_pids()` for immediate repaint.
+- Cursed rows are pinned to the top of the visible table. A suspended process falls to 0% CPU and would otherwise drop out of the `MAX_PROCS` window, stranding the curse until exit.
 - PID `0`, PID `1`, and the `gtop` process itself are protected and cannot be cursed.
 - `closeEvent` resumes every cursed PID before stopping the worker, so exiting `gtop` never leaves a process frozen.
 
